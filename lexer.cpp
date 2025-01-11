@@ -35,7 +35,7 @@
 #include <utility>
 
 //#ifdef OPTIMIZATION
-#define PRINT_ALIR
+//#define PRINT_ALIR
 
 
 //The lexer returns tokens [0-255] if it is an unknow character, otherwise one of these for know things.
@@ -456,6 +456,8 @@ static void HandleDefinition() {
   if (auto AST = ParseDefinition()) {
     fprintf(stderr, "Parsed a function definition.\n");
 		auto *IR = AST->codegen();
+		IR->print(llvm::errs());
+    fprintf(stderr, "\n");
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -466,6 +468,8 @@ static void HandleExtern() {
   if (auto AST = ParseExtern()) {
     fprintf(stderr, "Parsed an extern\n");
 		auto *IR = AST->codegen();
+		IR->print(llvm::errs());
+    fprintf(stderr, "\n");
   } else {
     // Skip token for error recovery.
     getNextToken();
