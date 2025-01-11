@@ -20,6 +20,8 @@
 #include "llvm/Transforms/Scalar/Reassociate.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 
+#include "include/mylexer.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -31,6 +33,9 @@
 #include <string>
 #include <iostream>
 #include <utility>
+
+//#ifdef OPTIMIZATION
+#define PRINT_ALIR
 
 
 //The lexer returns tokens [0-255] if it is an unknow character, otherwise one of these for know things.
@@ -55,7 +60,7 @@ static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value *> NamedValues;
 
-//static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 static std::unique_ptr<llvm::FunctionPassManager> TheFPM;
 static std::unique_ptr<llvm::LoopAnalysisManager> TheLAM;
 static std::unique_ptr<llvm::FunctionAnalysisManager> TheFAM;
@@ -64,7 +69,7 @@ static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
 static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
 static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
 //static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
-//static ExitOnError ExitOnErr;
+static llvm::ExitOnError ExitOnErr;
 
 //gettok - Return the next token from standard input.
 static int gettok()
@@ -441,7 +446,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
 	if(auto E = ParseExpression())
 	{
 		//Make an anonymous proto
-		auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+		auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
 		return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
 	}
 	return nullptr;
@@ -467,17 +472,85 @@ static void HandleExtern() {
   }
 }
 
+static void InitializeModule() {
+  // Open a new context and module.
+  TheContext = std::make_unique<llvm::LLVMContext>();
+  TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
+	TheModule->setDataLayout(TheJIT->getDataLayout());
+
+  // Create a new builder for the module.
+  Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique<llvm::FunctionPassManager>();
+  TheLAM = std::make_unique<llvm::LoopAnalysisManager>();
+  TheFAM = std::make_unique<llvm::FunctionAnalysisManager>();
+  TheCGAM = std::make_unique<llvm::CGSCCAnalysisManager>();
+  TheMAM = std::make_unique<llvm::ModuleAnalysisManager>();
+  ThePIC = std::make_unique<llvm::PassInstrumentationCallbacks>();
+  TheSI = std::make_unique<llvm::StandardInstrumentations>(
+                                                    /*DebugLogging*/ true);
+  TheSI->registerCallbacks(*ThePIC, TheFAM.get());
+
+  // Add transform passes.
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  TheFPM->addPass(llvm::InstCombinePass());
+  // Reassociate expressions.
+  TheFPM->addPass(llvm::ReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM->addPass(llvm::GVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->addPass(llvm::SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes.
+  llvm::PassBuilder PB;
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
+}
+
 static void HandleTopLevelExpression() {
 	auto AST = ParseTopLevelExpr();
   // Evaluate a top-level expression into an anonymous function.
   if (AST) {
     fprintf(stderr, "Parsed a top-level expr\n");
 		auto *IR = AST->codegen();
-		IR->print(llvm::errs());
-		fprintf(stderr,"\n");
+			#ifdef PRINT_ALIR
+      IR->print(llvm::errs());
+      fprintf(stderr,"\n");
+      // Remove the anonymous expression.
+      IR->eraseFromParent();
 
-    // Remove the anonymous expression.
-    IR->eraseFromParent();
+			#else
+      IR->print(llvm::errs());
+      fprintf(stderr,"\n");
+
+      // Create a ResourceTracker to track JIT'd memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+      auto TSM = llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      InitializeModule();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+      assert(ExprSymbol && "Function not found");
+
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+			#if 0
+      double (*FP)() = ExprSymbol.getAddress().toPtr<double (*)()>();
+			#else
+			llvm::JITTargetAddress funcAddr = ExprSymbol.getAddress(); // 从 JIT 获取的函数地址
+			double (*FP)() = reinterpret_cast<double (*)()>(static_cast<unsigned long>(funcAddr));
+			#endif
+
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT->remove());
+			#endif
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -614,7 +687,9 @@ llvm::Function *FunctionAST::codegen()
 		verifyFunction(*TheFunction);
 
 		// Optimize the function.
+		#ifdef OPTIMIZATION
 		TheFPM->run(*TheFunction, *TheFAM);
+		#endif
 
 		return TheFunction;
 	}
@@ -623,45 +698,13 @@ llvm::Function *FunctionAST::codegen()
 	return nullptr;
 }
 
-static void InitializeModule() {
-  // Open a new context and module.
-  TheContext = std::make_unique<llvm::LLVMContext>();
-  TheModule = std::make_unique<llvm::Module>("my cool jit", *TheContext);
-	//TheModule->setDataLayout(TheJIT->getDataLayout());
-
-  // Create a new builder for the module.
-  Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
-
-  // Create new pass and analysis managers.
-  TheFPM = std::make_unique<llvm::FunctionPassManager>();
-  TheLAM = std::make_unique<llvm::LoopAnalysisManager>();
-  TheFAM = std::make_unique<llvm::FunctionAnalysisManager>();
-  TheCGAM = std::make_unique<llvm::CGSCCAnalysisManager>();
-  TheMAM = std::make_unique<llvm::ModuleAnalysisManager>();
-  ThePIC = std::make_unique<llvm::PassInstrumentationCallbacks>();
-  TheSI = std::make_unique<llvm::StandardInstrumentations>(
-                                                    /*DebugLogging*/ true);
-  TheSI->registerCallbacks(*ThePIC, TheFAM.get());
-
-  // Add transform passes.
-  // Do simple "peephole" optimizations and bit-twiddling optzns.
-  TheFPM->addPass(llvm::InstCombinePass());
-  // Reassociate expressions.
-  TheFPM->addPass(llvm::ReassociatePass());
-  // Eliminate Common SubExpressions.
-  TheFPM->addPass(llvm::GVNPass());
-  // Simplify the control flow graph (deleting unreachable blocks, etc).
-  TheFPM->addPass(llvm::SimplifyCFGPass());
-
-  // Register analysis passes used in these transform passes.
-  llvm::PassBuilder PB;
-  PB.registerModuleAnalyses(*TheMAM);
-  PB.registerFunctionAnalyses(*TheFAM);
-  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
-}
 
 int main()
 {
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
 	// Install standard binary operators.
 	// 1 is lowest precedence.
 	BinopPrecedence['<'] = 10;
@@ -671,6 +714,8 @@ int main()
 	BinopPrecedence['/'] = 40;
 	BinopPrecedence['*'] = 40; //highest
 	
+	TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+
 	InitializeModule();
 
 	fprintf(stderr, "ready> ");
