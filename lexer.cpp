@@ -36,7 +36,9 @@
 
 //#ifdef OPTIMIZATION
 //#define PRINT_ALIR
+#define RECALL
 
+static void InitializeModule();
 
 //The lexer returns tokens [0-255] if it is an unknow character, otherwise one of these for know things.
 enum Token
@@ -68,7 +70,6 @@ static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCGAM;
 static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
 static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
 static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
-//static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 static llvm::ExitOnError ExitOnErr;
 
 //gettok - Return the next token from standard input.
@@ -204,6 +205,24 @@ class PrototypeAST
 	}
 	llvm::Function *codegen();
 };
+
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+
+llvm::Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
 
 /// FunctionAst - This class represents a functions a function definition ifself.
 class FunctionAST
@@ -458,6 +477,10 @@ static void HandleDefinition() {
 		auto *IR = AST->codegen();
 		IR->print(llvm::errs());
     fprintf(stderr, "\n");
+
+     ExitOnErr(TheJIT->addModule(
+          llvm::orc::ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+     InitializeModule();
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -470,6 +493,8 @@ static void HandleExtern() {
 		auto *IR = AST->codegen();
 		IR->print(llvm::errs());
     fprintf(stderr, "\n");
+
+		FunctionProtos[AST->getName()] = std::move(AST);
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -623,7 +648,8 @@ llvm::Value *BinaryExprAST::codegen()
 llvm::Value * CallExprAst::codegen()
 {
 	//Look up the name in the golbal module table.
-	llvm::Function *CalleeF = TheModule->getFunction(Callee);
+	//llvm::Function *CalleeF = TheModule->getFunction(Callee);
+	llvm::Function *CalleeF = getFunction(Callee);
 	if(!CalleeF)
 		return LogErrorV("Unknow function referenced");
 
@@ -661,6 +687,16 @@ llvm::Function *PrototypeAST::codegen()
 
 llvm::Function *FunctionAST::codegen()
 {
+	#ifdef RECALL
+	// Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  llvm::Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+	#else
 	//First, check for an existing function from a previous 'extern' declaration.
 	llvm::Function * TheFunction = TheModule->getFunction(Proto->getName());
 	
@@ -672,6 +708,7 @@ llvm::Function *FunctionAST::codegen()
 
 	if(!TheFunction->empty())
 		return (llvm::Function *)LogErrorV("Function cannot be redefined.");
+	#endif
 
 	//Create a new basic block to start insertion into.
 	llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
