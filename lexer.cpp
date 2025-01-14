@@ -38,8 +38,7 @@
 //#define PRINT_ALIR
 #define RECALL
 
-static void InitializeModule();
-
+/********************************************************* lexer **************************************************************/
 //The lexer returns tokens [0-255] if it is an unknow character, otherwise one of these for know things.
 enum Token
 {
@@ -56,21 +55,6 @@ enum Token
 
 static std::string IdentifierStr; // Filled in if tok identifier
 static double NumVal;
-
-static std::unique_ptr<llvm::LLVMContext> TheContext;
-static std::unique_ptr<llvm::IRBuilder<>> Builder;
-static std::unique_ptr<llvm::Module> TheModule;
-static std::map<std::string, llvm::Value *> NamedValues;
-
-static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
-static std::unique_ptr<llvm::FunctionPassManager> TheFPM;
-static std::unique_ptr<llvm::LoopAnalysisManager> TheLAM;
-static std::unique_ptr<llvm::FunctionAnalysisManager> TheFAM;
-static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCGAM;
-static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
-static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
-static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
-static llvm::ExitOnError ExitOnErr;
 
 //gettok - Return the next token from standard input.
 static int gettok()
@@ -129,6 +113,8 @@ static int gettok()
 	return ThisChar;
 }
 
+/********************************************************* parser **************************************************************/
+
 ///ExprAST - Base class for all expression nodes.
 class ExprAST
 {
@@ -140,111 +126,84 @@ class ExprAST
 //NumberExprAST - Expression class for numeric literals like "1.0".
 class NumberExprAST : public ExprAST
 {
-	double Val;
+		double Val;
 	public:
-	NumberExprAST(double V) : Val(V){}
-	llvm::Value *codegen() override;
+		NumberExprAST(double V) : Val(V){}
+		llvm::Value *codegen() override;
 };
-
-llvm::Value * NumberExprAST::codegen()
-{
-	return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
-}
 
 ///VariableExprAST - Expression class for referencing a variable, like "a"
 class VariableExprAST : public ExprAST
 {
-	std::string Name;
+		std::string Name;
 
 	public:
-	VariableExprAST(const std::string &N) : Name(N){}
-	llvm::Value *codegen() override;
+		VariableExprAST(const std::string &N) : Name(N){}
+		llvm::Value *codegen() override;
 };
 
 ///BinaryExprAST - Expression class for a binary operator.
 class BinaryExprAST : public ExprAST
 {
-	char Op;
-	std::unique_ptr<ExprAST> LHS, RHS;
+		char Op;
+		std::unique_ptr<ExprAST> LHS, RHS;
 
 	public:
-	BinaryExprAST(
-							char Op, 
-							std::unique_ptr<ExprAST> LHS, 
-							std::unique_ptr<ExprAST> RHS) :
-		Op(Op) , LHS(std::move(LHS)), RHS(std::move(RHS)) {}
-	llvm::Value *codegen() override;
+		BinaryExprAST(
+								char Op, 
+								std::unique_ptr<ExprAST> LHS, 
+								std::unique_ptr<ExprAST> RHS) :
+			Op(Op) , LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+		llvm::Value *codegen() override;
 };
 
 ///CallExprAst - Expression class for function calls.
 class CallExprAst : public ExprAST
 {
-	std::string Callee;
-	std::vector<std::unique_ptr<ExprAST>> Args;
+		std::string Callee;
+		std::vector<std::unique_ptr<ExprAST>> Args;
 
 	public:
-	CallExprAst(
-							const std::string &Callee, 
-							std::vector<std::unique_ptr<ExprAST>> Args) :
-		Callee(Callee), Args(std::move(Args)){}
-	llvm::Value *codegen() override;
+		CallExprAst(
+								const std::string &Callee, 
+								std::vector<std::unique_ptr<ExprAST>> Args) :
+			Callee(Callee), Args(std::move(Args)){}
+		llvm::Value *codegen() override;
 };
 ///PrototypeAST - This class represents the "prototype" for a function,
 ///which captures its name, and its argument names (thus implicitly the number of arguments the function takes.)
 class PrototypeAST
 {
-	std::string Name;
-	std::vector<std::string> Args;
+		std::string Name;
+		std::vector<std::string> Args;
 
 	public:
-	PrototypeAST(const std::string &Name, std::vector<std::string> Args):
-		Name(Name), Args(std::move(Args)){}
+		PrototypeAST(const std::string &Name, std::vector<std::string> Args):
+			Name(Name), Args(std::move(Args)){}
 
-	const std::string &getName() const {
-		return Name;
-	}
-	llvm::Function *codegen();
+		const std::string &getName() const {
+			return Name;
+		}
+		llvm::Function *codegen();
 };
-
-static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
-
-llvm::Function *getFunction(std::string Name) {
-  // First, see if the function has already been added to the current module.
-  if (auto *F = TheModule->getFunction(Name))
-    return F;
-
-  // If not, check whether we can codegen the declaration from some existing
-  // prototype.
-  auto FI = FunctionProtos.find(Name);
-  if (FI != FunctionProtos.end())
-    return FI->second->codegen();
-
-  // If no existing prototype exists, return null.
-  return nullptr;
-}
-
 
 /// FunctionAst - This class represents a functions a function definition ifself.
 class FunctionAST
 {
-	std::unique_ptr<PrototypeAST> Proto;
-	std::unique_ptr<ExprAST> Body;
+		std::unique_ptr<PrototypeAST> Proto;
+		std::unique_ptr<ExprAST> Body;
 
 	public:
-	FunctionAST(std::unique_ptr<PrototypeAST> Proto,
-							std::unique_ptr<ExprAST> Body):
-		Proto(std::move(Proto)), Body(std::move(Body))
-	{ }
-	llvm::Function *codegen();
+		FunctionAST(std::unique_ptr<PrototypeAST> Proto,
+								std::unique_ptr<ExprAST> Body):
+			Proto(std::move(Proto)), Body(std::move(Body))
+		{ }
+		llvm::Function *codegen();
 };
-
-static std::unique_ptr<ExprAST> ParsePrimary();
-static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec, std::unique_ptr<ExprAST> LHS);
-static std::unique_ptr<ExprAST> ParseParenExpr();
 
 /// CurTok/getNextToken - Provide a simple token buffer. CurTok is the current
 /// token the parser is looking at. getNextToken reads another token from the lexer and updates CurTok with its results.
-static int CurTok;
+static int CurTok = ';';
 static int getNextToken()
 {
 	return CurTok = gettok();
@@ -276,14 +235,21 @@ static std::unique_ptr<ExprAST> ParseNumberExpr()
 	return std::move(Result);
 }
 
-/// expression
-/// ::= primary binoprhs
-static std::unique_ptr<ExprAST> ParseExpression()
+static std::unique_ptr<ExprAST> ParseExpression();
+/// pareexpr ::= '(' expression ')'
+static std::unique_ptr<ExprAST> ParseParenExpr()
 {
-	auto LHS = ParsePrimary();
-	if(!LHS)
+	getNextToken(); // eat (
+	auto V = ParseExpression();
+
+	if(!V)
 		return nullptr;
-	return ParseBinOpRHS(0, std::move(LHS));
+
+	if(CurTok != ')')
+		return LogError("expected ')'");
+	getNextToken();
+
+	return V;
 }
 
 /// identifierexpr
@@ -343,24 +309,6 @@ static std::unique_ptr<ExprAST> ParsePrimary()
 	}
 }
 
-/// pareexpr ::= '(' expression ')'
-static std::unique_ptr<ExprAST> ParseParenExpr()
-{
-	getNextToken(); // eat (
-	auto V = ParseExpression();
-
-	if(!V)
-		return nullptr;
-
-	if(CurTok != ')')
-		return LogError("expected ')'");
-	getNextToken();
-
-	return V;
-}
-
-
-
 /// BinopPrecedence - This holds the precedence for each binary operator that is defined.
 static std::map<char, int> BinopPrecedence;
 /// GetTokPrecedence - Get the precedence of the pending binary operator token.
@@ -411,6 +359,16 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
 		//Merge LHS/RHS.
 		LHS = std::make_unique<BinaryExprAST>(BinOp, std::move(LHS), std::move(RHS));
 	}//loop around to the top of the while loop.
+}
+
+/// expression
+/// ::= primary binoprhs
+static std::unique_ptr<ExprAST> ParseExpression()
+{
+	auto LHS = ParsePrimary();
+	if(!LHS)
+		return nullptr;
+	return ParseBinOpRHS(0, std::move(LHS));
 }
 
 /// Prototype
@@ -470,6 +428,45 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr()
 	}
 	return nullptr;
 }
+/********************************************************* codegen **************************************************************/
+static std::unique_ptr<llvm::LLVMContext> TheContext;
+static std::unique_ptr<llvm::IRBuilder<>> Builder;
+static std::unique_ptr<llvm::Module> TheModule;
+static std::map<std::string, llvm::Value *> NamedValues;
+
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<llvm::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::LoopAnalysisManager> TheLAM;
+static std::unique_ptr<llvm::FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
+static llvm::ExitOnError ExitOnErr;
+
+llvm::Value * NumberExprAST::codegen()
+{
+	return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
+}
+
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+
+llvm::Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule->getFunction(Name))
+    return F;
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end())
+    return FI->second->codegen();
+
+  // If no existing prototype exists, return null.
+  return nullptr;
+}
+
+static void InitializeModule();
 
 static void HandleDefinition() {
   if (auto AST = ParseDefinition()) {
@@ -739,13 +736,8 @@ llvm::Function *FunctionAST::codegen()
 	return nullptr;
 }
 
-
 int main()
 {
-  llvm::InitializeNativeTarget();
-  llvm::InitializeNativeTargetAsmPrinter();
-  llvm::InitializeNativeTargetAsmParser();
-
 	// Install standard binary operators.
 	// 1 is lowest precedence.
 	BinopPrecedence['<'] = 10;
@@ -754,13 +746,14 @@ int main()
 	BinopPrecedence['-'] = 20;
 	BinopPrecedence['/'] = 40;
 	BinopPrecedence['*'] = 40; //highest
+
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
 	
 	TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
 
 	InitializeModule();
-
-	fprintf(stderr, "ready> ");
-	getNextToken();
 
 	Mainloop();
 
