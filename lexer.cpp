@@ -434,19 +434,41 @@ static std::unique_ptr<llvm::IRBuilder<>> Builder;
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value *> NamedValues;
 
-static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
-static std::unique_ptr<llvm::FunctionPassManager> TheFPM;
-static std::unique_ptr<llvm::LoopAnalysisManager> TheLAM;
-static std::unique_ptr<llvm::FunctionAnalysisManager> TheFAM;
-static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCGAM;
-static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
-static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
-static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
-static llvm::ExitOnError ExitOnErr;
-
 llvm::Value * NumberExprAST::codegen()
 {
 	return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
+}
+
+llvm::Value *VariableExprAST::codegen()
+{
+	llvm::Value * V = NamedValues[Name];
+	if(!V)
+		LogErrorV("Unknow variable name");
+	return V;
+}
+
+llvm::Value *BinaryExprAST::codegen()
+{
+	llvm::Value *L = LHS->codegen();
+	llvm::Value *R = RHS->codegen();
+	if(!L || !R)
+		return nullptr;
+
+	switch(Op)
+	{
+		case '+':
+			return Builder->CreateFAdd(L, R, "addtmp");
+		case '-':
+			return Builder->CreateFSub(L, R, "subtmp");
+		case '*':
+			return Builder->CreateFMul(L, R, "multmp");
+		case '<':
+			L = Builder->CreateFCmpULT(L, R, "cmptmp");
+			//Convert bool 0/1 to double 0.0 or 1.0
+			return Builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*TheContext), "booltmp");
+		default:
+			return LogErrorV("invalid binary operator");
+	}
 }
 
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
@@ -465,6 +487,111 @@ llvm::Function *getFunction(std::string Name) {
   // If no existing prototype exists, return null.
   return nullptr;
 }
+
+llvm::Value * CallExprAst::codegen()
+{
+	//Look up the name in the golbal module table.
+	//llvm::Function *CalleeF = TheModule->getFunction(Callee);
+	llvm::Function *CalleeF = getFunction(Callee);
+	if(!CalleeF)
+		return LogErrorV("Unknow function referenced");
+
+	//If argument mismatch error.
+	if(CalleeF->arg_size() != Args.size())
+		return LogErrorV("Incorrect #arguments passed");
+
+	std::vector<llvm::Value *> ArgsV;
+	for(unsigned i = 0, e = Args.size(); i !=e; ++i)
+	{
+		ArgsV.push_back(Args[i]->codegen());
+		if(!ArgsV.back())
+			return nullptr;
+	}
+
+	return Builder->CreateCall(CalleeF, ArgsV, "Calltmp");
+}
+
+llvm::Function *PrototypeAST::codegen()
+{
+	//Make the function type: double(double,double) etc.
+	std::vector<llvm::Type*> Doubles(Args.size(), llvm::Type::getDoubleTy(*TheContext));
+
+	llvm::FunctionType *FT = llvm::FunctionType::get(llvm::Type::getDoubleTy(*TheContext), Doubles, false);
+
+	llvm::Function *F = llvm::Function::Create(FT, llvm::Function::ExternalLinkage, Name, TheModule.get());
+
+	//Set names for all arguments.
+	unsigned Idx = 0;
+	for(auto &Arg : F->args())
+		Arg.setName(Args[Idx++]);
+
+	return F;
+}
+
+llvm::Function *FunctionAST::codegen()
+{
+	#ifdef RECALL
+	// Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  llvm::Function *TheFunction = getFunction(P.getName());
+  if (!TheFunction)
+    return nullptr;
+
+	#else
+	//First, check for an existing function from a previous 'extern' declaration.
+	llvm::Function * TheFunction = TheModule->getFunction(Proto->getName());
+	
+	if(!TheFunction)
+		TheFunction = Proto->codegen();
+
+	if(!TheFunction)
+		return nullptr;
+
+	if(!TheFunction->empty())
+		return (llvm::Function *)LogErrorV("Function cannot be redefined.");
+	#endif
+
+	//Create a new basic block to start insertion into.
+	llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
+	Builder->SetInsertPoint(BB);
+
+	//Record the function arguments in the NamedValues map.
+	NamedValues.clear();
+	for(auto &Arg : TheFunction->args())
+		NamedValues[std::string(Arg.getName())] = &Arg;
+
+	if(llvm::Value *RetVal = Body->codegen())
+	{
+		//Finish off the function.
+		Builder->CreateRet(RetVal);
+
+		//Validate the generated code, checking for consistency.
+		verifyFunction(*TheFunction);
+
+		// Optimize the function.
+		#ifdef OPTIMIZATION
+		TheFPM->run(*TheFunction, *TheFAM);
+		#endif
+
+		return TheFunction;
+	}
+
+	TheFunction->eraseFromParent();
+	return nullptr;
+}
+
+/********************************************************* jit **************************************************************/
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+static std::unique_ptr<llvm::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::LoopAnalysisManager> TheLAM;
+static std::unique_ptr<llvm::FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
+static llvm::ExitOnError ExitOnErr;
 
 static void InitializeModule();
 
@@ -608,132 +735,6 @@ static void Mainloop()
 				break;
 		}
 	}
-}
-
-llvm::Value *VariableExprAST::codegen()
-{
-	llvm::Value * V = NamedValues[Name];
-	if(!V)
-		LogErrorV("Unknow variable name");
-	return V;
-}
-
-llvm::Value *BinaryExprAST::codegen()
-{
-	llvm::Value *L = LHS->codegen();
-	llvm::Value *R = RHS->codegen();
-	if(!L || !R)
-		return nullptr;
-
-	switch(Op)
-	{
-		case '+':
-			return Builder->CreateFAdd(L, R, "addtmp");
-		case '-':
-			return Builder->CreateFSub(L, R, "subtmp");
-		case '*':
-			return Builder->CreateFMul(L, R, "multmp");
-		case '<':
-			L = Builder->CreateFCmpULT(L, R, "cmptmp");
-			//Convert bool 0/1 to double 0.0 or 1.0
-			return Builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*TheContext), "booltmp");
-		default:
-			return LogErrorV("invalid binary operator");
-	}
-}
-
-llvm::Value * CallExprAst::codegen()
-{
-	//Look up the name in the golbal module table.
-	//llvm::Function *CalleeF = TheModule->getFunction(Callee);
-	llvm::Function *CalleeF = getFunction(Callee);
-	if(!CalleeF)
-		return LogErrorV("Unknow function referenced");
-
-	//If argument mismatch error.
-	if(CalleeF->arg_size() != Args.size())
-		return LogErrorV("Incorrect #arguments passed");
-
-	std::vector<llvm::Value *> ArgsV;
-	for(unsigned i = 0, e = Args.size(); i !=e; ++i)
-	{
-		ArgsV.push_back(Args[i]->codegen());
-		if(!ArgsV.back())
-			return nullptr;
-	}
-
-	return Builder->CreateCall(CalleeF, ArgsV, "Calltmp");
-}
-
-llvm::Function *PrototypeAST::codegen()
-{
-	//Make the function type: double(double,double) etc.
-	std::vector<llvm::Type*> Doubles(Args.size(), llvm::Type::getDoubleTy(*TheContext));
-
-	llvm::FunctionType *FT = llvm::FunctionType::get(llvm::Type::getDoubleTy(*TheContext), Doubles, false);
-
-	llvm::Function *F = llvm::Function::Create(FT, llvm::Function::ExternalLinkage, Name, TheModule.get());
-
-	//Set names for all arguments.
-	unsigned Idx = 0;
-	for(auto &Arg : F->args())
-		Arg.setName(Args[Idx++]);
-
-	return F;
-}
-
-llvm::Function *FunctionAST::codegen()
-{
-	#ifdef RECALL
-	// Transfer ownership of the prototype to the FunctionProtos map, but keep a
-  // reference to it for use below.
-  auto &P = *Proto;
-  FunctionProtos[Proto->getName()] = std::move(Proto);
-  llvm::Function *TheFunction = getFunction(P.getName());
-  if (!TheFunction)
-    return nullptr;
-
-	#else
-	//First, check for an existing function from a previous 'extern' declaration.
-	llvm::Function * TheFunction = TheModule->getFunction(Proto->getName());
-	
-	if(!TheFunction)
-		TheFunction = Proto->codegen();
-
-	if(!TheFunction)
-		return nullptr;
-
-	if(!TheFunction->empty())
-		return (llvm::Function *)LogErrorV("Function cannot be redefined.");
-	#endif
-
-	//Create a new basic block to start insertion into.
-	llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
-	Builder->SetInsertPoint(BB);
-
-	//Record the function arguments in the NamedValues map.
-	NamedValues.clear();
-	for(auto &Arg : TheFunction->args())
-		NamedValues[std::string(Arg.getName())] = &Arg;
-
-	if(llvm::Value *RetVal = Body->codegen())
-	{
-		//Finish off the function.
-		Builder->CreateRet(RetVal);
-
-		//Validate the generated code, checking for consistency.
-		verifyFunction(*TheFunction);
-
-		// Optimize the function.
-		#ifdef OPTIMIZATION
-		TheFPM->run(*TheFunction, *TheFAM);
-		#endif
-
-		return TheFunction;
-	}
-
-	TheFunction->eraseFromParent();
-	return nullptr;
 }
 
 int main()
