@@ -1,10 +1,6 @@
-4+5;
 def foo(a b) a*a + 2*a*b + b*b; 3+4;
 def myadd(a b) a*a + 1 + 1;
-def test(x) (1+2+x)*(x+(1+2));
-test(12);
 extern sin(x);
-sin(1.0);
 def testfunc(x y) x + y*2;
-testfunc(4, 10);
-testfunc(5, 10);
+def cccmp(x) if x then 1 else 2;
+cccmp(0)

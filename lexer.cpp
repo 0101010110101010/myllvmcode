@@ -51,6 +51,11 @@ enum Token
 	//primary
 	tok_identifier = -4,
 	tok_number = -5,
+
+	// control
+	tok_if = -6,
+	tok_then = -7,
+	tok_else = -8,
 };
 
 static std::string IdentifierStr; // Filled in if tok identifier
@@ -75,6 +80,14 @@ static int gettok()
 			return tok_def;
 		if(IdentifierStr == "extern")
 			return tok_extern;
+
+		if (IdentifierStr == "if")
+			  return tok_if;
+		if (IdentifierStr == "then")
+			  return tok_then;
+		if (IdentifierStr == "else")
+			  return tok_else;
+
 		return tok_identifier;
 	}
 
@@ -170,6 +183,20 @@ class CallExprAst : public ExprAST
 			Callee(Callee), Args(std::move(Args)){}
 		llvm::Value *codegen() override;
 };
+
+/// IfExprAST - Expresion class for if/than/else.
+class IfExprAST : public ExprAST
+{
+	std::unique_ptr<ExprAST> Cond, Then, Else;
+
+	public:
+	IfExprAST(std::unique_ptr<ExprAST> C, 
+						std::unique_ptr<ExprAST> T,
+						std::unique_ptr<ExprAST> E) : Cond(std::move(C)), Then(std::move(T)), Else(std::move(E)) 
+	{}
+	llvm::Value * codegen() override;
+};
+
 ///PrototypeAST - This class represents the "prototype" for a function,
 ///which captures its name, and its argument names (thus implicitly the number of arguments the function takes.)
 class PrototypeAST
@@ -290,10 +317,40 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr()
 	return std::make_unique<CallExprAst>(IdName, std::move(Args));
 }
 
+///ifexpr::= 'if' expression 'then' expression 'else' expression
+static std::unique_ptr<ExprAST> ParseIfExpr()
+{
+	getNextToken();
+
+	//condition
+	auto Cond = ParseExpression();
+	if(!Cond)
+		return nullptr;
+
+	if(CurTok != tok_then)
+		return LogError("expected then");
+	getNextToken();
+
+	auto Then = ParseExpression();
+	if(!Then)
+		return nullptr;
+
+	if(CurTok != tok_else)
+		return LogError("expected else");
+
+	getNextToken();
+	auto Else = ParseExpression();
+	if(!Else)
+		return nullptr;
+
+	return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
+}
+
 /// primary
 /// ::= identifierexpr
 /// ::= numberexpr
 /// ::= parenexpr
+/// ::= ifexpr
 static std::unique_ptr<ExprAST> ParsePrimary()
 {
 	switch(CurTok)
@@ -306,6 +363,8 @@ static std::unique_ptr<ExprAST> ParsePrimary()
 			return ParseNumberExpr();
 		case '(':
 			return ParseParenExpr();
+		case tok_if:
+			return ParseIfExpr();
 	}
 }
 
@@ -528,6 +587,56 @@ llvm::Function *PrototypeAST::codegen()
 	return F;
 }
 
+llvm::Value *IfExprAST::codegen()
+{
+	llvm::Value * CondV = Cond->codegen();
+	if(!CondV)
+		return nullptr;
+
+	//Convert condition to a bool by comparing non-equal to 0.0
+	CondV = Builder->CreateFCmpONE(CondV, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)), "ifcond");
+
+	llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+	//Create blocks for the then and else cases. Insert the 'then' block at the
+	//end of the funcion
+
+	llvm::BasicBlock *ThenBB = llvm::BasicBlock::Create(*TheContext, "then", TheFunction);
+	llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(*TheContext, "Else");
+	llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(*TheContext, "ifcont");
+
+	Builder->CreateCondBr(CondV, ThenBB, ElseBB);
+
+	//Emit then value.
+	Builder->SetInsertPoint(ThenBB);
+
+	llvm::Value *ThenV = Then->codegen();
+	if(!ThenV)
+		return nullptr;
+
+	Builder->CreateBr(MergeBB);
+	//Codegen of 'Then' can change the current block, update ThenBB for the PHI.
+	ThenBB = Builder->GetInsertBlock();
+
+	//Emit else block.
+	TheFunction->getBasicBlockList().push_back(ElseBB);
+	Builder->SetInsertPoint(ElseBB);                                                         
+	llvm::Value * ElseV = Else->codegen();
+	if(!ElseV)
+		return nullptr;
+	Builder->CreateBr(MergeBB);
+	ElseBB = Builder->GetInsertBlock();
+
+	//Emit merge block.
+	TheFunction->getBasicBlockList().push_back(MergeBB);
+	Builder->SetInsertPoint(MergeBB);
+	llvm::PHINode * PN = Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, "iftmp");
+	PN->addIncoming(ThenV, ThenBB);
+	PN->addIncoming(ElseV, ElseBB);
+
+	return PN;
+}
+
 llvm::Function *FunctionAST::codegen()
 {
 	#ifdef RECALL
@@ -575,6 +684,8 @@ llvm::Function *FunctionAST::codegen()
 		TheFPM->run(*TheFunction, *TheFAM);
 		#endif
 
+		//TheFunction->viewCFG();
+		//TheFunction->viewCFG(Only);
 		return TheFunction;
 	}
 
@@ -599,7 +710,7 @@ static void HandleDefinition() {
   if (auto AST = ParseDefinition()) {
     fprintf(stderr, "Parsed a function definition.\n");
 		auto *IR = AST->codegen();
-		IR->print(llvm::errs());
+		IR->print(llvm::outs());
     fprintf(stderr, "\n");
 
      ExitOnErr(TheJIT->addModule(
@@ -615,7 +726,7 @@ static void HandleExtern() {
   if (auto AST = ParseExtern()) {
     fprintf(stderr, "Parsed an extern\n");
 		auto *IR = AST->codegen();
-		IR->print(llvm::errs());
+		IR->print(llvm::outs());
     fprintf(stderr, "\n");
 
 		FunctionProtos[AST->getName()] = std::move(AST);
@@ -669,13 +780,13 @@ static void HandleTopLevelExpression() {
     fprintf(stderr, "Parsed a top-level expr\n");
 		auto *IR = AST->codegen();
 			#ifdef PRINT_ALIR
-      IR->print(llvm::errs());
+      IR->print(llvm::outs());
       fprintf(stderr,"\n");
       // Remove the anonymous expression.
       IR->eraseFromParent();
 
 			#else
-      IR->print(llvm::errs());
+      IR->print(llvm::outs());
       fprintf(stderr,"\n");
 
       // Create a ResourceTracker to track JIT'd memory allocated to our
@@ -719,7 +830,7 @@ static void Mainloop()
 		switch(CurTok)
 		{
 			case tok_eof:
-				TheModule->print(llvm::errs(), nullptr);
+				TheModule->print(llvm::outs(), nullptr);
 				return;
 			case ';': //ignore top-level semicolons.
 				getNextToken();
