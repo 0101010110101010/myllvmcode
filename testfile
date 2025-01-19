@@ -1,6 +1,10 @@
-def foo(a b) a*a + 2*a*b + b*b; 3+4;
-def myadd(a b) a*a + 1 + 1;
-extern sin(x);
-def testfunc(x y) x + y*2;
-def cccmp(x) if x then 1 else 2;
-cccmp(0)
+extern putchard(char);
+#extern putchar(char);
+#def foo(a b) a*a + 2*a*b + b*b; 3+4;
+#def myadd(a b) a*a + 1 + 1;
+#extern sin(x);
+#def testfunc(x y) x + y*2;
+#def cccmp(x) if x then 1 else 2;
+#cccmp(0)
+def funcfor(x) for  i = 1, i < x, 1.0 in putchard(42);
+funcfor(10);
